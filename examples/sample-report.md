@@ -16,7 +16,7 @@
 | **Configuration LOC** | 1,278 (Markdown -- reported for context, not used in COCOMO) |
 | **Total Files** | 9 |
 | **Git Commits** | 1 |
-| **Contributors** | 1 (Margus Lamp) |
+| **Contributors** | 1 (mlamp) |
 | **Repository Age** | New (same day) |
 | **Active Development** | 2026-03-06 → 2026-03-06 |
 | **Tech Stack** | Shell/Bash, Markdown documentation, Claude Code skill |
