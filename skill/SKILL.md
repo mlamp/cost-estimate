@@ -151,9 +151,15 @@ timeout 60 cloc . --quiet --hide-rate \
   --exclude-dir=node_modules,.git,vendor,dist,build,.next,__pycache__,.venv,venv,env,.tox,.mypy_cache,.pytest_cache,coverage,.nyc_output,target,out,bin,obj,packages,.dart_tool,.pub-cache,Pods,DerivedData,generated,gen,__generated__,.generated \
   --exclude-ext=lock,sum,svg,png,jpg,jpeg,gif,ico,woff,woff2,ttf,eot,map,min.js,min.css,bundle.js,chunk.js \
   --json 2>/dev/null
+
+# Generate per-file manifest for Phase 1.5 deduplication
+timeout 60 cloc --by-file --csv . \
+  --exclude-dir=node_modules,.git,vendor,dist,build,.next,__pycache__,.venv,venv,env,.tox,.mypy_cache,.pytest_cache,coverage,.nyc_output,target,out,bin,obj,packages,.dart_tool,.pub-cache,Pods,DerivedData,generated,gen,__generated__,.generated \
+  --exclude-ext=lock,sum,svg,png,jpg,jpeg,gif,ico,woff,woff2,ttf,eot,map,min.js,min.css,bundle.js,chunk.js \
+  2>/dev/null | tail -n +2 | awk -F',' '{print $2"|"$1"|"$5}' > phase1a-manifest.txt
 ```
 
-If the cloc command fails (non-zero exit, empty output, output not valid JSON, or times out), fall back to the wc method below.
+If the cloc command fails (non-zero exit, empty output, output not valid JSON, or times out), fall back to the wc method below. If the `phase1a-manifest.txt` generation fails, Phase 1.5 deduplication will be disabled (a warning will be emitted).
 
 **If CLOC_AVAILABLE=no or cloc failed:**
 
@@ -277,6 +283,451 @@ Use Glob to check for these config files (check them all in parallel):
 Read the primary config files (package.json, Cargo.toml, go.mod, pyproject.toml, etc.) to identify frameworks, dependencies, and project metadata.
 
 **If a config file exists but cannot be read** (binary, too large, permissions), skip it silently and note the stack as "detected via config file presence" rather than "detected via config file contents."
+
+---
+
+## PHASE 1.5: Intellectual Effort Artifact Detection
+
+This phase runs after Phase 1a (LOC counting) and can run in parallel with Phases 1b, 1c, and 1d. It does not replace any existing phase; it adds a parallel data stream that merges into Phase 3.
+
+**What Phase 1.5 does:** Scans the repository for non-code files (prompts, configs, rubrics, domain rules), classifies each into one of 5 tiers based on intellectual effort density, and converts physical lines into "equivalent effort LOC" using tier-specific multipliers.
+
+**The 5 tiers at a glance:**
+
+| Tier | Name | Multiplier | One-liner |
+|------|------|------------|-----------|
+| T0 | Excluded | 0x | Auto-generated, lock files, trivial READMEs |
+| T1 | Boilerplate | 0.1x | Standard configs with no decision logic |
+| T2 | Structured Knowledge | 0.5x | Configs with constraints or conditional logic |
+| T3 | Domain Expertise | 1.5x | Agent instructions, rubrics, architecture decisions |
+| T4 | Novel Methodology | 3.0x | Dense prompt engineering, decision trees, novel frameworks |
+
+**OUTPUT:** A single structured block `INTELLECTUAL_EFFORT_SUMMARY` (format specified in Phase 1.5 Output Format section below) containing per-file tier classification with equivalent effort LOC and totals for integration into Phase 3.
+
+**CONTEXT BUDGET:** Phase 1.5 output MUST fit within ~2KB typical, 5KB hard cap. TIER_DETAIL table capped at 30 rows (top 30 by equivalent effort LOC descending). Remaining files summarized as a single aggregate row.
+
+**FAILURE MODES:**
+- If zero candidate files found: emit `INTELLECTUAL_EFFORT_SUMMARY` with all counts zero and note "No intellectual effort artifacts detected." Skip integration steps in Phase 3.
+- If grep or find commands fail (permissions, filesystem errors): log the error, classify the affected file as Tier 1 (safe fallback), and continue. Never halt the pipeline for a single file failure.
+- If Phase 1a manifest is missing: emit a warning "Phase 1a manifest not found; deduplication disabled" and proceed without deduplication (all intellectual effort LOC treated as additive).
+- On pipeline abort or error: the cleanup trap (set in Step 1.5a) removes all temporary files automatically.
+
+**Shell Environment Requirement:** All Phase 1.5 bash blocks (Steps 1.5a through 1.5d and the git revision check) MUST execute in the same shell session so that `IE_TMPDIR` and all derived paths (`CANDIDATE_LIST`, `AUTO_GENERATED_LIST`, `SIGNALS_FILE`, `CLASSIFICATION_FILE`) remain accessible across steps.
+
+### Step 1.5a: Candidate File Discovery
+
+Run this single bash block to find all non-source-code files that may contain intellectual effort. Output is saved to a temp file for use in subsequent steps:
+
+```bash
+echo "=== INTELLECTUAL EFFORT ARTIFACT SCAN ==="
+
+# Create temp directory and set cleanup trap
+IE_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$IE_TMPDIR"' EXIT
+CANDIDATE_LIST="$IE_TMPDIR/candidates.txt"
+> "$CANDIDATE_LIST"
+
+# Common exclusion arguments (reused per find invocation)
+COMMON_EXCLUDES=(
+  -not -path '*/.git/*'
+  -not -path '*/node_modules/*'
+  -not -path '*/vendor/*'
+  -not -path '*/dist/*'
+  -not -path '*/build/*'
+  -not -path '*/.venv/*'
+  -not -path '*/CHANGELOG*'
+  -not -path '*/LICENSE*'
+  -not -path '*/CONTRIBUTING*'
+  -not -name 'LICENSE*'
+  -not -name 'CHANGELOG*'
+)
+
+# Category 1: Prompt and agent instruction files
+echo "--- PROMPT_FILES ---"
+find . -maxdepth 8 -type f \( -name '*.md' -o -name '*.txt' -o -name '*.prompt' -o -name '*.system' \) \
+  "${COMMON_EXCLUDES[@]}" \
+  2>/dev/null | while IFS= read -r f; do
+    LINES=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+    LINES=${LINES:-0}; LINES=$((LINES + 0))
+    echo "PROMPT_CANDIDATE|$f|$LINES"
+    echo "$f|$LINES" >> "$CANDIDATE_LIST"
+done
+
+# Category 2: Configuration-as-knowledge files
+echo "--- CONFIG_KNOWLEDGE_FILES ---"
+find . -maxdepth 8 -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.toml' -o -name '*.json' -o -name '*.hcl' -o -name '*.tf' -o -name '*.tfvars' \) \
+  "${COMMON_EXCLUDES[@]}" \
+  -not -name 'package-lock.json' -not -name 'yarn.lock' -not -name 'pnpm-lock.yaml' \
+  -not -name '*.min.json' \
+  2>/dev/null | while IFS= read -r f; do
+    LINES=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+    LINES=${LINES:-0}; LINES=$((LINES + 0))
+    echo "CONFIG_CANDIDATE|$f|$LINES"
+    echo "$f|$LINES" >> "$CANDIDATE_LIST"
+done
+
+# Category 3: Domain rule and rubric files
+echo "--- RULE_FILES ---"
+find . -maxdepth 8 -type f \( -name '*.rules' -o -name '*.rubric' -o -name '*.criteria' -o -name '*.schema' \
+  -o -name 'CLAUDE.md' -o -name '.cursorrules' -o -name '.windsurfrules' \
+  -o -name 'AGENTS.md' -o -name 'CONVENTIONS.md' -o -name 'CODING_STANDARDS.md' \) \
+  "${COMMON_EXCLUDES[@]}" \
+  2>/dev/null | while IFS= read -r f; do
+    LINES=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+    LINES=${LINES:-0}; LINES=$((LINES + 0))
+    echo "RULE_CANDIDATE|$f|$LINES"
+    echo "$f|$LINES" >> "$CANDIDATE_LIST"
+done
+
+TOTAL_CANDIDATES=$(wc -l < "$CANDIDATE_LIST" | tr -d ' ')
+echo "TOTAL_CANDIDATES=$TOTAL_CANDIDATES"
+
+# Hard cap: if >100 candidates, keep only top 100 by line count for full classification.
+# Remaining files are auto-classified as Tier 1.
+if [ "$TOTAL_CANDIDATES" -gt 100 ]; then
+  echo "WARNING: $TOTAL_CANDIDATES candidates exceed 100-file cap. Classifying top 100 by line count; rest default to Tier 1."
+  sort -t'|' -k2 -rn "$CANDIDATE_LIST" | head -100 > "$IE_TMPDIR/top.txt"
+  sort -t'|' -k2 -rn "$CANDIDATE_LIST" | tail -n +101 > "$IE_TMPDIR/overflow.txt"
+  mv "$IE_TMPDIR/top.txt" "$CANDIDATE_LIST"
+fi
+```
+
+### Step 1.5b: Auto-Generation Detection
+
+Before classifying any candidate, check if it was auto-generated:
+
+```bash
+echo "=== AUTO-GENERATION CHECK ==="
+AUTO_GENERATED_LIST="$IE_TMPDIR/autogen.txt"
+> "$AUTO_GENERATED_LIST"
+
+while IFS='|' read -r FILE LINES; do
+  HEADER=$(head -5 "$FILE" 2>/dev/null)
+  if echo "$HEADER" | grep -qiE '(auto.?generated|do not edit|generated by|this file is generated|machine generated)'; then
+    echo "AUTO_GENERATED|$FILE|$LINES"
+    echo "$FILE" >> "$AUTO_GENERATED_LIST"
+  fi
+done < "$CANDIDATE_LIST"
+
+# Check for very large JSON/YAML that are likely generated (>50KB)
+while IFS='|' read -r FILE LINES; do
+  case "$FILE" in
+    *.json|*.yaml|*.yml)
+      SIZE=$(wc -c < "$FILE" 2>/dev/null | tr -d ' ')
+      if [ "$SIZE" -gt 51200 ]; then
+        echo "LARGE_DATA_FILE|$FILE|$LINES"
+        echo "$FILE" >> "$AUTO_GENERATED_LIST"
+      fi
+      ;;
+  esac
+done < "$CANDIDATE_LIST"
+```
+
+**Decision rules for auto-generated files:**
+- Files with `AUTO_GENERATED` marker: classify as Tier 0 (excluded) -- zero effort credit
+- Files flagged as `LARGE_DATA_FILE` (>50KB of JSON/YAML): classify as Tier 0 unless they contain evidence of hand-crafted structure (see Step 1.5c signal detection; if CONDITIONAL_COUNT + CONSTRAINT_COUNT >= 10, reclassify using standard tier rules)
+
+### Step 1.5c: Signal Detection
+
+For each candidate file NOT excluded as auto-generated, detect classification signals. All five signal counts are computed per file in a single awk pass to avoid sequential grep overhead:
+
+```bash
+echo "=== CLASSIFICATION SIGNALS ==="
+SIGNALS_FILE="$IE_TMPDIR/signals.txt"
+> "$SIGNALS_FILE"
+
+while IFS='|' read -r FILE LINES; do
+  # Skip auto-generated files
+  if grep -qFx "$FILE" "$AUTO_GENERATED_LIST" 2>/dev/null; then
+    continue
+  fi
+
+  # Size guard: skip files over 1MB to prevent hangs
+  FILE_SIZE=$(wc -c < "$FILE" 2>/dev/null | tr -d ' ')
+  FILE_SIZE=${FILE_SIZE:-0}
+  if [ "$FILE_SIZE" -gt 1048576 ]; then
+    echo "SKIPPED_OVERSIZE|$FILE|$LINES|${FILE_SIZE}bytes"
+    echo "$FILE|$LINES|0|0|0|0|0|0|" >> "$SIGNALS_FILE"
+    continue
+  fi
+
+  # Validate LINES is numeric
+  LINES=${LINES:-0}; LINES=$((LINES + 0))
+
+  # Check for frontmatter override tag in first 3 lines
+  OVERRIDE_TIER=$(head -3 "$FILE" 2>/dev/null | grep -oE 'intellectual-effort-tier: *[0-4]' | grep -oE '[0-4]')
+  if [ -n "$OVERRIDE_TIER" ]; then
+    echo "$FILE|$LINES|OVERRIDE|OVERRIDE|OVERRIDE|OVERRIDE|OVERRIDE|OVERRIDE|$OVERRIDE_TIER" >> "$SIGNALS_FILE"
+    continue
+  fi
+
+  # Single awk pass for all signal counts, with 5-second timeout
+  read CONDITIONAL CONSTRAINT DOMAIN_TERM INSTRUCTION EXAMPLE <<< $(timeout 5 awk '
+    BEGIN { cond=0; cons=0; dom=0; inst=0; exam=0 }
+    /if |when |unless |must |never |always |only when|except |provided that|in case of|decision:|choose / { cond++ }
+    /constraint|requirement|rule |invariant|precondition|postcondition|boundary|limit|threshold|maximum|minimum|exactly|at least|at most|no more than|no fewer than/ { cons++ }
+    /architecture|pattern|anti-?pattern|trade-?off|failure mode|edge case|fallback|degradation|scaling|latency|throughput|consistency|availability|partition/ { dom++ }
+    /you (are|will|must|should)|your (role|task|job)|respond with|output (format|as|in)|do not|never |always |(step|phase|stage) [0-9]/ { inst++ }
+    /example:|e\.g\.|for instance|such as|template:|format:|schema:|sample:|\{[a-z_]+\}|<[a-z_]+>/ { exam++ }
+    END { print cond, cons, dom, inst, exam }
+  ' "$FILE" 2>/dev/null)
+
+  CONDITIONAL=${CONDITIONAL:-0}
+  CONSTRAINT=${CONSTRAINT:-0}
+  DOMAIN_TERM=${DOMAIN_TERM:-0}
+  INSTRUCTION=${INSTRUCTION:-0}
+  EXAMPLE=${EXAMPLE:-0}
+
+  # Density as integer permille (signals per 1000 lines)
+  TOTAL_SIGNALS=$((CONDITIONAL + CONSTRAINT + DOMAIN_TERM + INSTRUCTION + EXAMPLE))
+  if [ "$LINES" -gt 0 ]; then
+    DENSITY_PERMILLE=$(( TOTAL_SIGNALS * 1000 / LINES ))
+  else
+    DENSITY_PERMILLE=0
+  fi
+
+  echo "$FILE|$LINES|$CONDITIONAL|$CONSTRAINT|$DOMAIN_TERM|$INSTRUCTION|$EXAMPLE|$DENSITY_PERMILLE|" >> "$SIGNALS_FILE"
+done < "$CANDIDATE_LIST"
+```
+
+**Language limitation:** Signal detection regex patterns are English-only. For non-English repositories, authors can add a frontmatter override tag in the first 3 lines of the file: `<!-- intellectual-effort-tier: 3 -->`. Valid values: 0, 1, 2, 3, 4.
+
+### Step 1.5d: Tier Classification
+
+This step reads the signals file from Step 1.5c and applies the complete decision tree:
+
+```bash
+echo "=== TIER CLASSIFICATION ==="
+CLASSIFICATION_FILE="$IE_TMPDIR/classifications.txt"
+> "$CLASSIFICATION_FILE"
+
+# Header: FILE|LINES|TIER|MULTIPLIER|EQUIV_LOC|FLOOR_APPLIED|DENSITY_PERMILLE
+while IFS='|' read -r FILE LINES COND CONS DOM INST EXAM DENS OVERRIDE_TIER; do
+
+  # Validate LINES is numeric
+  LINES=${LINES:-0}; LINES=$((LINES + 0))
+
+  # --- Frontmatter override ---
+  if [ "$COND" = "OVERRIDE" ]; then
+    TIER="$OVERRIDE_TIER"
+    case "$TIER" in
+      0) MULT=0 ;;
+      1) MULT=100 ;;
+      2) MULT=500 ;;
+      3) MULT=1500 ;;
+      4) MULT=3000 ;;
+    esac
+    EQUIV=$(( LINES * MULT / 1000 ))
+    FLOOR="No"
+    if [ "$TIER" -ge 3 ] && [ "$LINES" -lt 30 ]; then
+      if [ "$EQUIV" -lt 150 ]; then
+        EQUIV=150
+        FLOOR="Yes"
+      fi
+    fi
+    echo "$FILE|$LINES|$TIER|$MULT|$EQUIV|$FLOOR|OVERRIDE" >> "$CLASSIFICATION_FILE"
+    continue
+  fi
+
+  # --- Tier 0 checks (ANY of these) ---
+  IS_TIER0="no"
+
+  case "$(basename "$FILE")" in
+    package-lock.json|yarn.lock|pnpm-lock.yaml|CHANGELOG*|LICENSE*) IS_TIER0="yes" ;;
+  esac
+
+  # README under 20 lines with very low density
+  case "$(basename "$FILE")" in
+    README*|readme*)
+      if [ "$LINES" -lt 20 ] && [ "$DENS" -lt 30 ]; then
+        IS_TIER0="yes"
+      fi
+      ;;
+  esac
+
+  if [ "$IS_TIER0" = "yes" ]; then
+    echo "$FILE|$LINES|0|0|0|No|$DENS" >> "$CLASSIFICATION_FILE"
+    continue
+  fi
+
+  # --- Tier assignment by density (primary) with count confirmation ---
+  if [ "$DENS" -ge 200 ]; then
+    # Candidate Tier 4: Novel Methodology
+    if [ "$INST" -ge 12 ] && [ "$CONS" -ge 8 ]; then
+      TIER=4; MULT=3000
+    elif [ "$INST" -lt 8 ] && [ "$CONS" -lt 5 ]; then
+      TIER=3; MULT=1500
+    else
+      TIER=3; MULT=1500
+    fi
+
+  elif [ "$DENS" -ge 100 ]; then
+    # Candidate Tier 3: Domain Expertise
+    if [ "$INST" -lt 4 ] && [ "$CONS" -lt 3 ]; then
+      TIER=2; MULT=500
+    else
+      TIER=3; MULT=1500
+    fi
+
+  elif [ "$DENS" -ge 30 ]; then
+    # Candidate Tier 2: Structured Knowledge
+    if [ "$CONS" -lt 3 ] && [ "$COND" -lt 3 ]; then
+      TIER=1; MULT=100
+    else
+      TIER=2; MULT=500
+    fi
+
+  else
+    # density < 30: Candidate Tier 1 (Boilerplate)
+    if [ "$INST" -ge 3 ] || [ "$COND" -ge 3 ]; then
+      TIER=2; MULT=500
+    else
+      TIER=1; MULT=100
+    fi
+  fi
+
+  # --- Compute equivalent effort LOC ---
+  EQUIV=$(( LINES * MULT / 1000 ))
+
+  # --- Short file floor for Tier 3+ ---
+  FLOOR="No"
+  if [ "$TIER" -ge 3 ] && [ "$LINES" -lt 30 ]; then
+    if [ "$EQUIV" -lt 150 ]; then
+      EQUIV=150
+      FLOOR="Yes"
+    fi
+  fi
+
+  echo "$FILE|$LINES|$TIER|$MULT|$EQUIV|$FLOOR|$DENS" >> "$CLASSIFICATION_FILE"
+done < "$SIGNALS_FILE"
+
+# --- Handle overflow files (defaulted to Tier 1) ---
+if [ -f "$IE_TMPDIR/overflow.txt" ]; then
+  while IFS='|' read -r FILE LINES; do
+    LINES=${LINES:-0}; LINES=$((LINES + 0))
+    EQUIV=$(( LINES * 100 / 1000 ))
+    echo "$FILE|$LINES|1|100|$EQUIV|No|0" >> "$CLASSIFICATION_FILE"
+  done < "$IE_TMPDIR/overflow.txt"
+fi
+
+echo "=== CLASSIFICATION COMPLETE ==="
+wc -l < "$CLASSIFICATION_FILE" | tr -d ' ' | xargs -I{} echo "FILES_CLASSIFIED={}"
+```
+
+#### Tier Decision Tree (Reference)
+
+Density thresholds use permille (per-1000) integer values:
+- 30 permille = 0.03 density
+- 100 permille = 0.10 density
+- 200 permille = 0.20 density
+
+Multipliers are also stored as integer permille (100 = 0.1x, 500 = 0.5x, 1500 = 1.5x, 3000 = 3.0x).
+
+```
+DECISION: Intellectual Effort Tier
+|
++-- CHECK: Does file have frontmatter override tag?
+|   YES -> Use declared tier. Skip remaining checks.
+|
++-- TIER 0: Excluded (multiplier = 0)
+|  Criteria (ANY of):
+|    - Auto-generated marker in first 5 lines
+|    - JSON/YAML file > 50KB with CONDITIONAL + CONSTRAINT < 10
+|    - Lock files, changelog, license files
+|    - README under 20 lines with density_permille < 30
+|
++-- TIER 1: Boilerplate (multiplier = 0.1x)
+|  Criteria:
+|    - density_permille < 30 (primary)
+|    - Confirmed by: INSTRUCTION < 3 AND CONDITIONAL < 3
+|    - If density < 30 but INSTRUCTION >= 3 OR CONDITIONAL >= 3, promote to Tier 2
+|
++-- TIER 2: Structured Knowledge (multiplier = 0.5x)
+|  Criteria:
+|    - density_permille 30-99 (primary)
+|    - Confirmed by: CONSTRAINT >= 3 OR CONDITIONAL >= 3
+|    - If density 30-99 but CONSTRAINT < 3 AND CONDITIONAL < 3, demote to Tier 1
+|
++-- TIER 3: Domain Expertise (multiplier = 1.5x)
+|  Criteria:
+|    - density_permille 100-199 (primary)
+|    - Demotion: if INSTRUCTION < 4 AND CONSTRAINT < 3, demote to Tier 2
+|
++-- TIER 4: Novel Methodology (multiplier = 3.0x)
+   Criteria:
+     - density_permille >= 200 (primary)
+     - Confirmed by: INSTRUCTION >= 12 AND CONSTRAINT >= 8
+     - If confirmation fails: demote to Tier 3
+```
+
+#### Git Revision History Signal (optional, advisory only)
+
+Git history is used ONLY as a promotion/demotion signal. It is NOT required for any tier classification. If git is unavailable, skip this step entirely.
+
+```bash
+echo "=== REVISION DEPTH CHECK (ADVISORY) ==="
+# Only run if git is available
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  REVISED_FILE="$IE_TMPDIR/classifications_revised.txt"
+  > "$REVISED_FILE"
+
+  while IFS='|' read -r FILE LINES TIER MULT EQUIV FLOOR DENS; do
+    # Only check Tier 3+ files for revision-based adjustments
+    if [ "$TIER" -ge 3 ]; then
+      REVISIONS=$(git log --oneline -- "$FILE" 2>/dev/null | wc -l | tr -d ' ')
+      echo "REVISIONS|$FILE|$REVISIONS|TIER=$TIER"
+
+      if [ "$REVISIONS" -ge 10 ] && [ "$TIER" -eq 3 ]; then
+        # Promote Tier 3 -> Tier 4
+        TIER=4; MULT=3000
+        EQUIV=$(( LINES * MULT / 1000 ))
+        if [ "$LINES" -lt 30 ] && [ "$EQUIV" -lt 150 ]; then
+          EQUIV=150
+          FLOOR="Yes"
+        fi
+        echo "PROMOTED|$FILE|T3->T4 (10+ revisions)"
+      elif [ "$REVISIONS" -le 1 ] && [ "$TIER" -eq 4 ]; then
+        # Demote Tier 4 -> Tier 3
+        TIER=3; MULT=1500
+        EQUIV=$(( LINES * MULT / 1000 ))
+        if [ "$LINES" -lt 30 ] && [ "$EQUIV" -lt 150 ]; then
+          EQUIV=150
+          FLOOR="Yes"
+        fi
+        echo "DEMOTED|$FILE|T4->T3 (0-1 revisions)"
+      fi
+    fi
+    echo "$FILE|$LINES|$TIER|$MULT|$EQUIV|$FLOOR|$DENS" >> "$REVISED_FILE"
+  done < "$CLASSIFICATION_FILE"
+
+  # Replace original with revised version
+  mv "$REVISED_FILE" "$CLASSIFICATION_FILE"
+else
+  echo "SKIP: git not available or not a git repository. Revision check skipped."
+fi
+```
+
+### Phase 1.5 Output Format
+
+Produce a structured summary for use in Phase 3. Cap TIER_DETAIL to 30 rows (top 30 by equivalent effort LOC descending); summarize remaining files as a single aggregate row.
+
+```
+INTELLECTUAL_EFFORT_SUMMARY:
+  total_candidates: {N}
+  excluded_auto_generated: {N}
+  overflow_defaulted_to_t1: {N or 0}
+  tier_counts: [T0: {N}, T1: {N}, T2: {N}, T3: {N}, T4: {N}]
+
+  TIER_DETAIL (top 30 by equiv effort LOC):
+  | File | Lines | Tier | Multiplier (permille) | Density (permille) | Equivalent Effort LOC | Floor Applied |
+  |------|-------|------|-----------------------|--------------------|----------------------|---------------|
+  | path/to/file.md | 450 | T3 | 1500 | 140 | 675 | No |
+  | path/to/short.md | 15 | T3 | 1500 | 250 | 150* | Yes |
+  | (remaining N files) | {sum} | - | - | - | {sum} | - |
+
+  total_physical_lines: {sum of all classified file lines}
+  total_equivalent_effort_loc: {sum of equivalent_effort_LOC for each file}
+```
 
 ---
 
@@ -452,6 +903,104 @@ where F = 0.28 + 0.2 * (E - 0.91)
 - Tdev: 1 decimal place (e.g., 6.2)
 - All intermediate calculations: use full precision; only round final displayed values.
 
+### Step 3.6b: Intellectual Effort Integration
+
+After computing the COCOMO base effort, integrate intellectual effort artifacts. This step runs the deduplication against the Phase 1a manifest and computes the combined effort.
+
+```bash
+echo "=== PHASE 3: INTELLECTUAL EFFORT INTEGRATION ==="
+
+# --- Input validation ---
+ORIGINAL_LOC=${ORIGINAL_LOC:-0}
+if [ "$ORIGINAL_LOC" -eq 0 ]; then
+  echo "WARNING: ORIGINAL_LOC is 0 or not set. Skipping COCOMO LOC adjustment."
+  SKIP_COCOMO_ADJUSTMENT="yes"
+else
+  SKIP_COCOMO_ADJUSTMENT="no"
+fi
+
+# --- Step 3a: Deduplication against Phase 1a manifest ---
+MANIFEST="phase1a-manifest.txt"
+DEDUP_SUBTRACT="$IE_TMPDIR/dedup_subtract.txt"
+> "$DEDUP_SUBTRACT"
+IE_TOTAL_EQUIV=0
+DEDUP_LINES_SUBTRACTED=0
+
+if [ -f "$MANIFEST" ]; then
+  echo "Phase 1a manifest found. Deduplication enabled."
+
+  while IFS='|' read -r FILE LINES TIER MULT EQUIV FLOOR DENS; do
+    LINES=${LINES:-0}; LINES=$((LINES + 0))
+    EQUIV=${EQUIV:-0}; EQUIV=$((EQUIV + 0))
+
+    if [ "$TIER" -ge 2 ]; then
+      # Normalize path: strip leading ./ from both sides for matching
+      NORM_FILE=$(echo "$FILE" | sed 's|^\./||')
+      MANIFEST_MATCH=$(awk -F'|' -v f="$NORM_FILE" '{gsub(/^\.\//,"",$2)} $2==f {print $1"|"$3}' "$MANIFEST")
+
+      if [ -n "$MANIFEST_MATCH" ]; then
+        # File is in COCOMO count -- subtract its lines from COCOMO, add equiv to IE
+        COCOMO_LANG=$(echo "$MANIFEST_MATCH" | cut -d'|' -f1)
+        COCOMO_LINES=$(echo "$MANIFEST_MATCH" | cut -d'|' -f2)
+        COCOMO_LINES=${COCOMO_LINES:-0}; COCOMO_LINES=$((COCOMO_LINES + 0))
+        echo "$COCOMO_LANG|$COCOMO_LINES" >> "$DEDUP_SUBTRACT"
+        DEDUP_LINES_SUBTRACTED=$((DEDUP_LINES_SUBTRACTED + COCOMO_LINES))
+        echo "DEDUP_RECLASSIFY|$FILE|subtract $COCOMO_LINES COCOMO lines ($COCOMO_LANG)|add $EQUIV equiv LOC"
+      fi
+      IE_TOTAL_EQUIV=$((IE_TOTAL_EQUIV + EQUIV))
+    fi
+    # Tier 0 and Tier 1 files: leave in COCOMO, do not add to IE total
+  done < "$CLASSIFICATION_FILE"
+else
+  echo "WARNING: Deduplication disabled; Phase 1a manifest not found."
+  # Add all Tier 2+ equiv LOC without subtracting from COCOMO
+  while IFS='|' read -r FILE LINES TIER MULT EQUIV FLOOR DENS; do
+    EQUIV=${EQUIV:-0}; EQUIV=$((EQUIV + 0))
+    if [ "$TIER" -ge 2 ]; then
+      IE_TOTAL_EQUIV=$((IE_TOTAL_EQUIV + EQUIV))
+    fi
+  done < "$CLASSIFICATION_FILE"
+fi
+
+echo "DEDUP_LINES_SUBTRACTED=$DEDUP_LINES_SUBTRACTED"
+echo "IE_TOTAL_EQUIV_LOC=$IE_TOTAL_EQUIV"
+
+# --- Step 3b: Compute adjusted KLOC for COCOMO ---
+if [ "$SKIP_COCOMO_ADJUSTMENT" = "yes" ]; then
+  ADJUSTED_LOC=$ORIGINAL_LOC
+  echo "ADJUSTED_LOC=$ADJUSTED_LOC (no adjustment)"
+else
+  ADJUSTED_LOC=$((ORIGINAL_LOC - DEDUP_LINES_SUBTRACTED))
+  if [ "$ADJUSTED_LOC" -lt 0 ]; then
+    echo "WARNING: ADJUSTED_LOC went negative. Clamping to 0."
+    ADJUSTED_LOC=0
+  fi
+  echo "ADJUSTED_LOC=$ADJUSTED_LOC (original $ORIGINAL_LOC minus $DEDUP_LINES_SUBTRACTED reclassified)"
+fi
+
+# --- Step 3c: Compute intellectual effort hours ---
+# HOURS_PER_KLOC derived from COCOMO: COCOMO_person_hours / COCOMO_KLOC
+HOURS_PER_KLOC=${HOURS_PER_KLOC:-100}  # fallback: 100 hours/KLOC if not set
+IE_HOURS=$(( IE_TOTAL_EQUIV * HOURS_PER_KLOC / 1000 ))
+IE_PM=$(( IE_HOURS * 100 / 15200 ))  # person-months * 100 for 2-decimal precision
+IE_PM_INT=$((IE_PM / 100))
+IE_PM_FRAC=$((IE_PM % 100))
+
+echo "IE_HOURS=$IE_HOURS"
+echo "IE_PERSON_MONTHS=${IE_PM_INT}.${IE_PM_FRAC}"
+echo "=== PHASE 3 INTEGRATION COMPLETE ==="
+```
+
+**Adjusted KLOC:** After deduplication, recompute KLOC = ADJUSTED_LOC / 1000 and re-run the COCOMO formula with this adjusted value. The adjusted COCOMO effort plus the intellectual effort hours gives the combined total.
+
+**Combined effort:**
+```
+Total_Effort_Hours = COCOMO_Effort_Hours (using adjusted KLOC) + IE_Hours
+Total_Effort_PM = Total_Effort_Hours / 152
+```
+
+The IE_Hours use the project's own COCOMO-derived hours/KLOC rate (`COCOMO_person_hours / COCOMO_KLOC`), so intellectual effort scales with project complexity.
+
 ### Step 3.7: Function Points (secondary metric)
 
 Use these LOC-per-FP ratios to estimate function points from code lines (source: Jones, C. Applied Software Measurement, 3rd ed. McGraw-Hill):
@@ -484,9 +1033,11 @@ Use these LOC-per-FP ratios to estimate function points from code lines (source:
 **Multi-language function point calculation:**
 
 1. For each source-code language detected, divide that language's code lines by its LOC/FP ratio to get that language's function points.
-2. Sum all per-language function points. This is the total FP.
+2. Sum all per-language function points. This is the Source Code FP.
 3. **If a language is not in the table above**, use a default of **50 LOC/FP**.
-4. Round total FP to the nearest whole number.
+4. **Intellectual Effort FP:** `IE_FP = total_equivalent_effort_LOC / 40` (unified ratio for all IE artifacts; midpoint between declarative language density ~50 LOC/FP per Jones 2008 and specification density ~30 LOC/FP per IFPUG SNAP v2.4).
+5. `Total_FP = Source_Code_FP + IE_FP`
+6. Round total FP to the nearest whole number.
 
 ### Step 3.8: Effort Ranges
 
@@ -672,6 +1223,28 @@ All packages are analyzed as a single aggregate project for cost estimation purp
 
 [Score bars: use N filled ⬛ followed by (5-N) empty ⬜, e.g. score 3 = ⬛⬛⬛⬜⬜]
 
+[If any Tier 2+ intellectual effort artifacts were found, include this section. If no Tier 2+ files found, collapse to a single line: "No significant intellectual effort artifacts detected beyond standard configuration."]
+
+```markdown
+## Intellectual Effort Artifacts
+
+Non-code files representing significant domain expertise, prompt engineering, or encoded methodology.
+
+| Classification | Files | Physical Lines | Equiv. Effort LOC | Key Files |
+|----------------|-------|---------------|-------------------|-----------|
+| Novel Methodology (T4, 3.0x) | {N} | {N} | {N} | {top 3 file names} |
+| Domain Expertise (T3, 1.5x) | {N} | {N} | {N} | {top 3 file names} |
+| Structured Knowledge (T2, 0.5x) | {N} | {N} | {N} | {top 3 file names} |
+| Boilerplate (T1, 0.1x) | {N} | {N} | {N} | (not listed) |
+| Excluded (T0) | {N} | {N} | 0 | (not listed) |
+| **Total** | **{N}** | **{N}** | **{N}** | |
+
+> Intellectual effort artifacts add **{equivalent_effort_LOC}** equivalent LOC to the project,
+> representing **{percentage of total effort}%** of total estimated effort.
+```
+
+[Display rules: Only show tiers that have >= 1 file. Tiers ordered descending: T4, T3, T2, T1, T0. List "Key Files" for Tier 2+ only (max 3 files per tier, sorted by equivalent_effort_LOC descending). Files with short file floor applied are marked with *.]
+
 ```markdown
 ## ⚙️ Effort Estimation
 
@@ -682,9 +1255,10 @@ All packages are analyzed as a single aggregate project for cost estimation purp
 | Exponent E | {from Step 3.3} |
 | Effort Multipliers | CPLX={val}, DATA={val}, RELY={val}, PLEX={val}, DOCU={val} |
 | EAF (product of EMs) | {from Step 3.5} |
-| **Base Effort** | **{from Step 3.6, e.g. "14.3 person-months"}** |
-| **Estimated Person-Hours** | **{from Step 3.6, e.g. "2,170 hours"}** |
-| Estimated Function Points | {from Step 3.7, e.g. "270 FP"} |
+| **Source Code Effort** | **{COCOMO effort using adjusted KLOC, e.g. "12.1 person-months (1,840 hours)"}** |
+| **Intellectual Effort Artifacts** | **{IE_PM person-months (IE_Hours hours)}** |
+| **Combined Base Effort** | **{Total_Effort_PM person-months (Total_Effort_Hours hours)}** |
+| Estimated Function Points | {from Step 3.7, e.g. "270 FP" (Source Code FP + IE FP)} |
 | Schedule (Tdev) | {from Step 3.6, e.g. "6.2 months"} (ideal) |
 
 ### Effort Range
@@ -725,6 +1299,7 @@ All packages are analyzed as a single aggregate project for cost estimation purp
 
 > **If someone asked "what would it cost to build this from scratch?"**
 > The realistic answer is **{Growth Co Low cost} - {Growth Co High cost}** with a team of {Effective Devs for Growth Co} engineers over {Growth Co Calendar Time Mid} months.
+> {If IE_Hours > 0: "This includes **{IE_Hours} hours** of intellectual effort in non-code artifacts (prompts, domain configs, methodology documents)."}
 ```
 
 [ONLY if $ARGUMENTS is non-empty, include the following section. Parse the numeric hours value from the argument string using regex `(\d+\.?\d*)`. If no numeric value is found, show the section with the raw argument text but omit all numeric rows (Speed Multiple, Cost, Cost Savings).]
@@ -765,6 +1340,7 @@ All packages are analyzed as a single aggregate project for cost estimation purp
 - **Rates:** Fully-loaded US consulting/agency rates (2025-2026), not salary equivalents
 - **Overhead:** Accounts for hiring/onboarding, organizational coordination, compliance processes, and institutional overhead beyond direct development (see Team Profiles note)
 - **Exclusions:** Generated code, lock files, vendored dependencies, build artifacts, config/markup files (from KLOC){if vendored dirs found: ", vendored directories: {list}"}
+- **Intellectual Effort:** Non-code artifacts (prompts, domain configs, rubrics) estimated using a 4-tier classification system (Boilerplate 0.1x, Structured Knowledge 0.5x, Domain Expertise 1.5x, Novel Methodology 3.0x) based on automated signal detection (conditional language density, constraint patterns, instructional density). Constants derived from Jones, *Applied Software Measurement* (3rd ed., 2008) and IFPUG SNAP Assessment Practices Manual v2.4 (2017). Intellectual effort estimation is a supplementary methodology, not part of standard COCOMO II.
 - **Conservative bias:** Estimates lean toward underestimation; actual costs often exceed parametric predictions for novel or poorly-defined projects
 - **Schedule:** COCOMO II Tdev formula: Tdev = 3.67 * PM^F where F = 0.28 + 0.2*(E-0.91); Calendar Time is the greater of naive parallelization (hours / headcount / 152) and Tdev, since Tdev represents the minimum feasible schedule regardless of staffing
 {if MONOREPO: "- **Monorepo:** Analyzed as single aggregate project; individual package estimates not provided"}
@@ -786,7 +1362,7 @@ All packages are analyzed as a single aggregate project for cost estimation purp
 
 These rules govern the entire analysis. They are not suggestions.
 
-1. **Parallelism:** Run all Phase 1 data collection steps (1a, 1b, 1c, 1d) in parallel. Do not wait for one to finish before starting another.
+1. **Parallelism:** Run all Phase 1 data collection steps (1a, 1b, 1c, 1d) in parallel. Phase 1.5 runs after Phase 1a completes, but can run in parallel with 1b, 1c, and 1d.
 2. **Precision:** Show actual calculated values in the report. Never leave a `{placeholder}` or `...` in the output.
 3. **Currency formatting:** Follow the rounding rules from Phase 4 exactly.
 4. **Number formatting:** Use commas for thousands separators in all numbers (e.g., 2,170 not 2170).
@@ -804,6 +1380,8 @@ These rules govern the entire analysis. They are not suggestions.
 8. **Conditional sections:** The AI Speed Comparison section appears ONLY if `$ARGUMENTS` is non-empty. Parse hours using regex `(\d+\.?\d*)`. If no number found, show text-only variant.
 9. **Error resilience:** If any single Bash command or tool call fails, continue with remaining data. Never abort the entire analysis due to a single failed command (except for the `EMPTY_REPO` abort condition).
 10. **Timeouts:** All `cloc` commands use `timeout 60`. All `find` and `grep` commands use `timeout 30`. If a command times out, treat output as empty and record a TIMEOUT flag for that step.
+11. **Intellectual effort rounding:** Equivalent effort LOC: round to nearest whole number. All density and multiplier values in integer permille.
+12. **Intellectual effort omission:** If no Tier 2+ intellectual effort artifacts are found, omit the Intellectual Effort Artifacts section from the report and show only: "No significant intellectual effort artifacts detected beyond standard configuration."
 
 ---
 
