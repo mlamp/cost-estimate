@@ -1,0 +1,8 @@
+.const 0 21
+.const 1 2
+; multiply 21 * 2
+PUSH 0
+PUSH 1
+MUL
+PRINT
+HALT
